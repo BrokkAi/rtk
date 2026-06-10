@@ -1257,9 +1257,26 @@ pub struct ParseFailureSummary {
 /// Record a parse failure without ever crashing.
 /// Silently ignores all errors — used in the fallback path.
 pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, succeeded: bool) {
+    if tracking_disabled() {
+        return;
+    }
     if let Ok(tracker) = Tracker::new() {
         let _ = tracker.record_parse_failure(raw_command, error_message, succeeded);
     }
+}
+
+fn tracking_disabled() -> bool {
+    tracking_disabled_for(
+        std::env::var("RTK_TRACKING_DISABLED").ok().as_deref(),
+        std::env::var("RTK_HOSTED").ok().as_deref(),
+    )
+}
+
+/// Pure gate logic, split from [`tracking_disabled`] for testability.
+/// Hosted embeddings (compile-time `hosted` feature or `RTK_HOSTED=1`)
+/// must not write tracking state into the host user's `$HOME`.
+fn tracking_disabled_for(tracking_disabled: Option<&str>, hosted: Option<&str>) -> bool {
+    cfg!(feature = "hosted") || tracking_disabled == Some("1") || hosted == Some("1")
 }
 
 /// Estimate token count from text using ~4 chars = 1 token heuristic.
@@ -1294,7 +1311,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use rtk::tracking::TimedExecution;
 ///
 /// let timer = TimedExecution::start();
@@ -1354,6 +1371,9 @@ impl TimedExecution {
     /// timer.track("ls -la", "rtk ls", input, output);
     /// ```
     pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
+        if tracking_disabled() {
+            return;
+        }
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         let input_tokens = estimate_tokens(input);
         let output_tokens = estimate_tokens(output);
@@ -1390,6 +1410,9 @@ impl TimedExecution {
     /// timer.track_passthrough("git tag", "rtk git tag");
     /// ```
     pub fn track_passthrough(&self, original_cmd: &str, rtk_cmd: &str) {
+        if tracking_disabled() {
+            return;
+        }
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         // input_tokens=0, output_tokens=0 won't dilute savings statistics
         if let Ok(tracker) = Tracker::new() {
@@ -1422,6 +1445,23 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // tracking_disabled_for — hosted embeddings (env or feature) must not
+    // write tracking state into the host user's $HOME.
+    #[test]
+    fn test_tracking_disabled_for_hosted_or_disabled_env() {
+        assert!(tracking_disabled_for(None, Some("1")));
+        assert!(tracking_disabled_for(Some("1"), None));
+        assert!(tracking_disabled_for(Some("1"), Some("1")));
+    }
+
+    #[test]
+    #[cfg(not(feature = "hosted"))]
+    fn test_tracking_disabled_for_default_off() {
+        assert!(!tracking_disabled_for(None, None));
+        assert!(!tracking_disabled_for(Some("0"), Some("0")));
+        assert!(!tracking_disabled_for(Some(""), Some("")));
+    }
 
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]

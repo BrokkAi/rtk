@@ -483,6 +483,21 @@ pub fn rewrite_command(
     excluded: &[String],
     transparent_prefixes: &[String],
 ) -> Option<String> {
+    rewrite_command_with_proxy(cmd, excluded, transparent_prefixes, "rtk")
+}
+
+/// Like [`rewrite_command`], but emits rewritten command segments using
+/// `proxy_prefix` instead of the default `rtk` binary name.
+///
+/// Hosts embedding RTK can pass a shell-quoted prefix such as
+/// `'/path/to/anvil' __rtk` so the returned shell string preserves operators
+/// while dispatching each rewritten segment through the host binary.
+pub fn rewrite_command_with_proxy(
+    cmd: &str,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+    proxy_prefix: &str,
+) -> Option<String> {
     // Bash line continuations (`\<NL>`, `\<CRLF>`) and the leading whitespace that
     // follows are syntactically equivalent to a single space, but `cmd.trim()` does
     // not unwrap them so a leading backslash-newline used to defeat the whole matcher.
@@ -512,7 +527,7 @@ pub fn rewrite_command(
         return Some(trimmed.to_string());
     }
 
-    rewrite_compound(trimmed, &compiled, &normalized_prefixes)
+    rewrite_compound(trimmed, &compiled, &normalized_prefixes, proxy_prefix)
 }
 
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
@@ -520,6 +535,7 @@ fn rewrite_compound(
     cmd: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
+    proxy_prefix: &str,
 ) -> Option<String> {
     let tokens = tokenize(cmd);
     let mut result = String::with_capacity(cmd.len() + 32);
@@ -533,7 +549,7 @@ fn rewrite_compound(
         match tok.kind {
             TokenKind::Operator => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
+                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes, proxy_prefix)
                     .unwrap_or_else(|| seg.to_string());
                 if rewritten != seg {
                     any_changed = true;
@@ -564,7 +580,7 @@ fn rewrite_compound(
                 let rewritten = if is_pipe_incompatible {
                     seg.to_string()
                 } else {
-                    rewrite_segment(seg, excluded, transparent_prefixes)
+                    rewrite_segment(seg, excluded, transparent_prefixes, proxy_prefix)
                         .unwrap_or_else(|| seg.to_string())
                 };
                 if rewritten != seg {
@@ -593,7 +609,7 @@ fn rewrite_compound(
             }
             TokenKind::Shellism if tok.value == "&" => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
+                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes, proxy_prefix)
                     .unwrap_or_else(|| seg.to_string());
                 if rewritten != seg {
                     any_changed = true;
@@ -610,8 +626,8 @@ fn rewrite_compound(
     }
 
     let seg = cmd[seg_start..].trim();
-    let rewritten =
-        rewrite_segment(seg, excluded, transparent_prefixes).unwrap_or_else(|| seg.to_string());
+    let rewritten = rewrite_segment(seg, excluded, transparent_prefixes, proxy_prefix)
+        .unwrap_or_else(|| seg.to_string());
     if rewritten != seg {
         any_changed = true;
     }
@@ -624,12 +640,17 @@ fn rewrite_compound(
     }
 }
 
-fn rewrite_line_range(cmd: &str) -> Option<String> {
+fn rewrite_line_range(cmd: &str, proxy_prefix: &str) -> Option<String> {
     for re in [&*HEAD_N, &*HEAD_LINES] {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!("rtk read {} --max-lines {}", file, n));
+            return Some(format!(
+                "{} read {} --max-lines {}",
+                proxy_prefix.trim(),
+                file,
+                n
+            ));
         }
     }
     if cmd.starts_with("head -") {
@@ -644,7 +665,12 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!("rtk read {} --tail-lines {}", file, n));
+            return Some(format!(
+                "{} read {} --tail-lines {}",
+                proxy_prefix.trim(),
+                file,
+                n
+            ));
         }
     }
     None
@@ -710,8 +736,9 @@ fn rewrite_segment(
     seg: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
+    proxy_prefix: &str,
 ) -> Option<String> {
-    rewrite_segment_inner(seg, excluded, transparent_prefixes, 0)
+    rewrite_segment_inner(seg, excluded, transparent_prefixes, proxy_prefix, 0)
 }
 
 fn is_excluded(cmd: &str, excluded: &[ExcludePattern]) -> bool {
@@ -725,6 +752,7 @@ fn rewrite_segment_inner(
     seg: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
+    proxy_prefix: &str,
     depth: usize,
 ) -> Option<String> {
     let trimmed = seg.trim();
@@ -747,8 +775,13 @@ fn rewrite_segment_inner(
             );
             return None;
         }
-        let rewritten =
-            rewrite_segment_inner(rest_after_env, excluded, transparent_prefixes, depth + 1)?;
+        let rewritten = rewrite_segment_inner(
+            rest_after_env,
+            excluded,
+            transparent_prefixes,
+            proxy_prefix,
+            depth + 1,
+        )?;
         return Some(format!("{}{}", env_prefix, rewritten));
     }
 
@@ -757,8 +790,14 @@ fn rewrite_segment_inner(
             if rest.is_empty() {
                 return None;
             }
-            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
-                .map(|rewritten| format!("{} {}", prefix, rewritten));
+            return rewrite_segment_inner(
+                rest,
+                excluded,
+                transparent_prefixes,
+                proxy_prefix,
+                depth + 1,
+            )
+            .map(|rewritten| format!("{} {}", prefix, rewritten));
         }
     }
 
@@ -769,8 +808,14 @@ fn rewrite_segment_inner(
             if rest.is_empty() {
                 return None;
             }
-            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
-                .map(|rewritten| format!("{} {}", prefix, rewritten));
+            return rewrite_segment_inner(
+                rest,
+                excluded,
+                transparent_prefixes,
+                proxy_prefix,
+                depth + 1,
+            )
+            .map(|rewritten| format!("{} {}", prefix, rewritten));
         }
     }
 
@@ -784,7 +829,8 @@ fn rewrite_segment_inner(
     }
 
     if cmd_part.starts_with("head -") || cmd_part.starts_with("tail ") {
-        return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
+        return rewrite_line_range(cmd_part, proxy_prefix)
+            .map(|r| format!("{}{}", r, redirect_suffix));
     }
 
     // Most cat flags (-v, -A, -e, -t, -s, -b, --show-all, etc.) have different
@@ -815,11 +861,17 @@ fn rewrite_segment_inner(
 
     if let Some(parts) = parse_golangci_run_parts(cmd_part) {
         let rewritten = if parts.global_segment.is_empty() {
-            format!("rtk golangci-lint {}", parts.run_segment)
+            format!(
+                "{} golangci-lint {}",
+                proxy_prefix.trim(),
+                parts.run_segment
+            )
         } else {
             format!(
-                "rtk golangci-lint {} {}",
-                parts.global_segment, parts.run_segment
+                "{} golangci-lint {} {}",
+                proxy_prefix.trim(),
+                parts.global_segment,
+                parts.run_segment
             )
         };
         return Some(rewritten);
@@ -841,15 +893,34 @@ fn rewrite_segment_inner(
     for &prefix in rule.rewrite_prefixes {
         if let Some(rest) = strip_word_prefix(cmd_part, prefix) {
             let rewritten = if rest.is_empty() {
-                format!("{}{}", rule.rtk_cmd, redirect_suffix)
+                format!(
+                    "{}{}",
+                    with_proxy(rule.rtk_cmd, proxy_prefix)?,
+                    redirect_suffix
+                )
             } else {
-                format!("{} {}{}", rule.rtk_cmd, rest, redirect_suffix)
+                format!(
+                    "{} {}{}",
+                    with_proxy(rule.rtk_cmd, proxy_prefix)?,
+                    rest,
+                    redirect_suffix
+                )
             };
             return Some(rewritten);
         }
     }
 
     None
+}
+
+fn with_proxy(rtk_cmd: &str, proxy_prefix: &str) -> Option<String> {
+    let rest = rtk_cmd.strip_prefix("rtk")?.trim_start();
+    let proxy = proxy_prefix.trim();
+    if rest.is_empty() {
+        Some(proxy.to_string())
+    } else {
+        Some(format!("{} {}", proxy, rest))
+    }
 }
 
 /// Strip a command prefix with word-boundary check.
@@ -874,6 +945,10 @@ mod tests {
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         super::rewrite_command(cmd, excluded, &[])
+    }
+
+    fn rewrite_command_with_host_proxy(cmd: &str) -> Option<String> {
+        super::rewrite_command_with_proxy(cmd, &[], &[], "'/opt/anvil' __rtk")
     }
 
     #[test]
@@ -920,6 +995,22 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("yadm status", &[]),
             Some("rtk git status".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_with_custom_proxy() {
+        assert_eq!(
+            rewrite_command_with_host_proxy("git status"),
+            Some("'/opt/anvil' __rtk git status".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_compound_with_custom_proxy() {
+        assert_eq!(
+            rewrite_command_with_host_proxy("cargo test && git status"),
+            Some("'/opt/anvil' __rtk cargo test && '/opt/anvil' __rtk git status".to_string())
         );
     }
 
