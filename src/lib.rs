@@ -1463,10 +1463,27 @@ pub fn main_entry() -> Result<()> {
     std::process::exit(code);
 }
 
+/// Run the rtk CLI with a caller-supplied argv and return its [`ExitCode`].
+///
+/// `args` is a full argv: clap skips the first item as the program name, so
+/// hosts must pass a placeholder (e.g. `"rtk"`) ahead of the real arguments —
+/// `["rtk", "git", "status"]`, not `["git", "status"]`.
+///
+/// # Process exit
+///
+/// This dispatch is exec-like, not a pure function call: several paths
+/// terminate the process directly instead of returning. `--help` and
+/// `--version` exit after printing, parse errors on rtk meta-commands exit
+/// with clap's error, and filters propagate a failing child command's exit
+/// code via `std::process::exit`. Hosts must not rely on code running after
+/// this call (cleanup, `atexit`, destructors).
 pub fn cli_entry(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     i32_to_exit_code(cli_entry_code(args))
 }
 
+/// Like [`cli_entry`], but returns the raw `i32` exit code.
+///
+/// The same argv shape and process-exit caveats as [`cli_entry`] apply.
 pub fn cli_entry_code(args: impl IntoIterator<Item = OsString>) -> i32 {
     reset_sigpipe();
     match run_cli_from(args) {
