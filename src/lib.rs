@@ -1452,15 +1452,7 @@ fn reset_sigpipe() {
 }
 
 pub fn main_entry() -> Result<()> {
-    reset_sigpipe();
-    let code = match run_cli() {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("rtk: {:#}", e);
-            1
-        }
-    };
-    std::process::exit(code);
+    std::process::exit(cli_entry_code(std::env::args_os()));
 }
 
 /// Run the rtk CLI with a caller-supplied argv and return its [`ExitCode`].
@@ -1525,10 +1517,6 @@ where
         let pi = agent == Some(AgentTarget::Pi);
         uninstall_standard(global, gemini, codex, cursor, pi, ctx)
     }
-}
-
-fn run_cli() -> Result<i32> {
-    run_cli_from(std::env::args_os())
 }
 
 fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
