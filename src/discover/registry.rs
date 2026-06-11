@@ -498,6 +498,8 @@ pub fn rewrite_command_with_proxy(
     transparent_prefixes: &[String],
     proxy_prefix: &str,
 ) -> Option<String> {
+    let proxy_prefix = proxy_prefix.trim();
+
     // Bash line continuations (`\<NL>`, `\<CRLF>`) and the leading whitespace that
     // follows are syntactically equivalent to a single space, but `cmd.trim()` does
     // not unwrap them so a leading backslash-newline used to defeat the whole matcher.
@@ -523,7 +525,11 @@ pub fn rewrite_command_with_proxy(
         || trimmed.contains(';')
         || trimmed.contains('|')
         || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if !has_compound
+        && (trimmed.starts_with("rtk ")
+            || trimmed == "rtk"
+            || strip_word_prefix(trimmed, proxy_prefix).is_some())
+    {
         return Some(trimmed.to_string());
     }
 
@@ -645,12 +651,7 @@ fn rewrite_line_range(cmd: &str, proxy_prefix: &str) -> Option<String> {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!(
-                "{} read {} --max-lines {}",
-                proxy_prefix.trim(),
-                file,
-                n
-            ));
+            return Some(format!("{} read {} --max-lines {}", proxy_prefix, file, n));
         }
     }
     if cmd.starts_with("head -") {
@@ -665,12 +666,7 @@ fn rewrite_line_range(cmd: &str, proxy_prefix: &str) -> Option<String> {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!(
-                "{} read {} --tail-lines {}",
-                proxy_prefix.trim(),
-                file,
-                n
-            ));
+            return Some(format!("{} read {} --tail-lines {}", proxy_prefix, file, n));
         }
     }
     None
@@ -823,8 +819,12 @@ fn rewrite_segment_inner(
     // e.g. "git status 2>&1" → match "git status", re-append " 2>&1"
     let (cmd_part, redirect_suffix) = strip_trailing_redirects(trimmed);
 
-    // Already RTK — pass through unchanged
-    if cmd_part.starts_with("rtk ") || cmd_part == "rtk" {
+    // Already RTK (or already dispatched through the host proxy) — pass
+    // through unchanged so a second rewrite pass is a no-op.
+    if cmd_part.starts_with("rtk ")
+        || cmd_part == "rtk"
+        || strip_word_prefix(cmd_part, proxy_prefix).is_some()
+    {
         return Some(trimmed.to_string());
     }
 
@@ -861,17 +861,11 @@ fn rewrite_segment_inner(
 
     if let Some(parts) = parse_golangci_run_parts(cmd_part) {
         let rewritten = if parts.global_segment.is_empty() {
-            format!(
-                "{} golangci-lint {}",
-                proxy_prefix.trim(),
-                parts.run_segment
-            )
+            format!("{} golangci-lint {}", proxy_prefix, parts.run_segment)
         } else {
             format!(
                 "{} golangci-lint {} {}",
-                proxy_prefix.trim(),
-                parts.global_segment,
-                parts.run_segment
+                proxy_prefix, parts.global_segment, parts.run_segment
             )
         };
         return Some(rewritten);
@@ -914,12 +908,11 @@ fn rewrite_segment_inner(
 }
 
 fn with_proxy(rtk_cmd: &str, proxy_prefix: &str) -> Option<String> {
-    let rest = rtk_cmd.strip_prefix("rtk")?.trim_start();
-    let proxy = proxy_prefix.trim();
+    let rest = strip_word_prefix(rtk_cmd, "rtk")?;
     if rest.is_empty() {
-        Some(proxy.to_string())
+        Some(proxy_prefix.to_string())
     } else {
-        Some(format!("{} {}", proxy, rest))
+        Some(format!("{} {}", proxy_prefix, rest))
     }
 }
 
@@ -1012,6 +1005,31 @@ mod tests {
             rewrite_command_with_host_proxy("cargo test && git status"),
             Some("'/opt/anvil' __rtk cargo test && '/opt/anvil' __rtk git status".to_string())
         );
+    }
+
+    #[test]
+    fn test_with_proxy_requires_rtk_word_boundary() {
+        assert_eq!(super::with_proxy("rtk git", "P"), Some("P git".to_string()));
+        assert_eq!(super::with_proxy("rtk", "P"), Some("P".to_string()));
+        // "rtkfoo" is not the rtk binary — must not be rewritten to "P foo".
+        assert_eq!(super::with_proxy("rtkfoo bar", "P"), None);
+    }
+
+    #[test]
+    fn test_rewrite_with_custom_proxy_is_idempotent() {
+        let once = rewrite_command_with_host_proxy("git status").expect("first rewrite");
+        // A second pass must recognize the proxied command as already
+        // rewritten, same as plain "rtk ..." commands.
+        assert_eq!(rewrite_command_with_host_proxy(&once), Some(once.clone()));
+    }
+
+    #[test]
+    fn test_rewrite_compound_with_custom_proxy_is_idempotent() {
+        let once =
+            rewrite_command_with_host_proxy("cargo test && git status").expect("first rewrite");
+        // None = no segment changed — the compound form must not be
+        // proxied a second time.
+        assert_eq!(rewrite_command_with_host_proxy(&once), None);
     }
 
     #[test]
