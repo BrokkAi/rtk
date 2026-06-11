@@ -73,6 +73,7 @@ lazy_static! {
     static ref TAIL_N_SPACE: Regex = Regex::new(r"^tail\s+-n\s+(\d+)\s+(\S+)$").unwrap();
     static ref TAIL_LINES_EQ: Regex = Regex::new(r"^tail\s+--lines=(\d+)\s+(\S+)$").unwrap();
     static ref TAIL_LINES_SPACE: Regex = Regex::new(r"^tail\s+--lines\s+(\d+)\s+(\S+)$").unwrap();
+    static ref SED_PRINT_RANGE: Regex = Regex::new(r"^(\d+)(?:,(\d+))?p$").unwrap();
 }
 
 const GOLANGCI_GLOBAL_OPT_WITH_VALUE: &[&str] = &[
@@ -95,6 +96,15 @@ pub fn classify_command(cmd: &str) -> Classification {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return Classification::Ignored;
+    }
+
+    if parse_sed_print_range(trimmed).is_some() {
+        return Classification::Supported {
+            rtk_equivalent: "rtk read",
+            category: "Files",
+            estimated_savings_pct: 60.0,
+            status: super::report::RtkStatus::Existing,
+        };
     }
 
     // Check ignored
@@ -625,6 +635,13 @@ fn rewrite_compound(
 }
 
 fn rewrite_line_range(cmd: &str) -> Option<String> {
+    if let Some((from_line, to_line, file)) = parse_sed_print_range(cmd) {
+        return Some(format!(
+            "rtk read {} --from-line {} --to-line {}",
+            file, from_line, to_line
+        ));
+    }
+
     for re in [&*HEAD_N, &*HEAD_LINES] {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
@@ -648,6 +665,41 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn parse_sed_print_range(cmd: &str) -> Option<(usize, usize, String)> {
+    let tokens = tokenize(cmd);
+    if tokens.len() != 4 || tokens.iter().any(|t| t.kind != TokenKind::Arg) {
+        return None;
+    }
+
+    if tokens[0].value != "sed" || tokens[1].value != "-n" {
+        return None;
+    }
+
+    let expr = unquote_simple(&tokens[2].value);
+    let caps = SED_PRINT_RANGE.captures(expr)?;
+    let from_line: usize = caps.get(1)?.as_str().parse().ok()?;
+    let to_line: usize = caps
+        .get(2)
+        .map(|m| m.as_str().parse().ok())
+        .unwrap_or(Some(from_line))?;
+    let file = tokens[3].value.as_str();
+    if file.starts_with('-') || from_line == 0 || to_line < from_line {
+        return None;
+    }
+
+    Some((from_line, to_line, file.to_string()))
+}
+
+fn unquote_simple(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Shell prefix builtins that modify how the shell runs a command
@@ -783,7 +835,10 @@ fn rewrite_segment_inner(
         return Some(trimmed.to_string());
     }
 
-    if cmd_part.starts_with("head -") || cmd_part.starts_with("tail ") {
+    if cmd_part.starts_with("head -")
+        || cmd_part.starts_with("tail ")
+        || cmd_part.starts_with("sed ")
+    {
         return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
     }
 
@@ -1828,6 +1883,56 @@ mod tests {
     #[test]
     fn test_rewrite_tail_plain_file_skipped() {
         assert_eq!(rewrite_command_no_prefixes("tail src/main.rs", &[]), None);
+    }
+
+    #[test]
+    fn test_classify_sed_print_range() {
+        assert_eq!(
+            classify_command("sed -n '2461,2959p' README.md"),
+            Classification::Supported {
+                rtk_equivalent: "rtk read",
+                category: "Files",
+                estimated_savings_pct: 60.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_rewrite_sed_print_range() {
+        assert_eq!(
+            rewrite_command_no_prefixes("sed -n '2461,2959p' README.md", &[]),
+            Some("rtk read README.md --from-line 2461 --to-line 2959".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_sed_single_print_line() {
+        assert_eq!(
+            rewrite_command_no_prefixes(r#"sed -n "12p" src/main.rs"#, &[]),
+            Some("rtk read src/main.rs --from-line 12 --to-line 12".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_sed_unquoted_print_range() {
+        assert_eq!(
+            rewrite_command_no_prefixes("sed -n 3,5p src/main.rs", &[]),
+            Some("rtk read src/main.rs --from-line 3 --to-line 5".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_sed_unsupported_forms_skipped() {
+        for command in [
+            "sed -i 's/a/b/' README.md",
+            "sed 's/a/b/' README.md",
+            "sed -n '1,10p' README.md CHANGELOG.md",
+            "sed -n '10,1p' README.md",
+            "sed -n '0,10p' README.md",
+        ] {
+            assert_eq!(rewrite_command_no_prefixes(command, &[]), None, "{command}");
+        }
     }
 
     // --- Issue #1362: head/tail with multiple files falls back to native command ---

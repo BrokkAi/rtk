@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 /// Target agent for hook installation.
@@ -105,6 +106,12 @@ enum Commands {
         /// Keep only last N lines
         #[arg(long, conflicts_with = "max_lines")]
         tail_lines: Option<usize>,
+        /// Start at 1-based line N
+        #[arg(long, conflicts_with_all = ["max_lines", "tail_lines"])]
+        from_line: Option<NonZeroUsize>,
+        /// Stop at 1-based line N
+        #[arg(long, conflicts_with_all = ["max_lines", "tail_lines"])]
+        to_line: Option<NonZeroUsize>,
         /// Show line numbers
         #[arg(short = 'n', long)]
         line_numbers: bool,
@@ -1437,10 +1444,14 @@ fn run_cli() -> Result<i32> {
             level,
             max_lines,
             tail_lines,
+            from_line,
+            to_line,
             line_numbers,
         } => {
             let mut had_error = false;
             let mut stdin_seen = false;
+            let from_line = from_line.map(usize::from);
+            let to_line = to_line.map(usize::from);
             for file in &files {
                 let result = if file == Path::new("-") {
                     if stdin_seen {
@@ -1448,13 +1459,23 @@ fn run_cli() -> Result<i32> {
                         continue;
                     }
                     stdin_seen = true;
-                    read::run_stdin(level, max_lines, tail_lines, line_numbers, cli.verbose)
+                    read::run_stdin(
+                        level,
+                        max_lines,
+                        tail_lines,
+                        from_line,
+                        to_line,
+                        line_numbers,
+                        cli.verbose,
+                    )
                 } else {
                     read::run(
                         file,
                         level,
                         max_lines,
                         tail_lines,
+                        from_line,
+                        to_line,
                         line_numbers,
                         cli.verbose,
                     )
@@ -2538,6 +2559,50 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::cell::Cell;
+
+    #[test]
+    fn test_read_line_range_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "rtk",
+            "read",
+            "README.md",
+            "--from-line",
+            "2",
+            "--to-line",
+            "4",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Read {
+                from_line, to_line, ..
+            } => {
+                assert_eq!(from_line.map(NonZeroUsize::get), Some(2));
+                assert_eq!(to_line.map(NonZeroUsize::get), Some(4));
+            }
+            _ => panic!("Expected Read command"),
+        }
+    }
+
+    #[test]
+    fn test_read_line_range_conflicts_with_max_lines() {
+        let result = Cli::try_parse_from([
+            "rtk",
+            "read",
+            "README.md",
+            "--max-lines",
+            "10",
+            "--from-line",
+            "2",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_line_range_rejects_zero() {
+        let result = Cli::try_parse_from(["rtk", "read", "README.md", "--from-line", "0"]);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_git_commit_single_message() {

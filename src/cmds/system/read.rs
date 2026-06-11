@@ -11,6 +11,8 @@ pub fn run(
     level: FilterLevel,
     max_lines: Option<usize>,
     tail_lines: Option<usize>,
+    from_line: Option<usize>,
+    to_line: Option<usize>,
     line_numbers: bool,
     verbose: u8,
 ) -> Result<()> {
@@ -63,7 +65,7 @@ pub fn run(
         );
     }
 
-    filtered = apply_line_window(&filtered, max_lines, tail_lines, &lang);
+    filtered = apply_line_window(&filtered, max_lines, tail_lines, from_line, to_line, &lang);
 
     let rtk_output = if line_numbers {
         format_with_line_numbers(&filtered)
@@ -84,6 +86,8 @@ pub fn run_stdin(
     level: FilterLevel,
     max_lines: Option<usize>,
     tail_lines: Option<usize>,
+    from_line: Option<usize>,
+    to_line: Option<usize>,
     line_numbers: bool,
     verbose: u8,
 ) -> Result<()> {
@@ -127,7 +131,7 @@ pub fn run_stdin(
         );
     }
 
-    filtered = apply_line_window(&filtered, max_lines, tail_lines, &lang);
+    filtered = apply_line_window(&filtered, max_lines, tail_lines, from_line, to_line, &lang);
 
     let rtk_output = if line_numbers {
         format_with_line_numbers(&filtered)
@@ -154,8 +158,26 @@ fn apply_line_window(
     content: &str,
     max_lines: Option<usize>,
     tail_lines: Option<usize>,
+    from_line: Option<usize>,
+    to_line: Option<usize>,
     lang: &Language,
 ) -> String {
+    if from_line.is_some() || to_line.is_some() {
+        let start_line = from_line.unwrap_or(1).max(1);
+        let end_line = to_line.unwrap_or(usize::MAX).max(start_line);
+        let lines: Vec<&str> = content.lines().collect();
+        let start = start_line.saturating_sub(1);
+        if start >= lines.len() {
+            return String::new();
+        }
+        let end = end_line.min(lines.len());
+        let mut result = lines[start..end].join("\n");
+        if content.ends_with('\n') && end == lines.len() {
+            result.push('\n');
+        }
+        return result;
+    }
+
     if let Some(tail) = tail_lines {
         if tail == 0 {
             return String::new();
@@ -194,7 +216,7 @@ fn main() {{
         )?;
 
         // Just verify it doesn't panic
-        run(file.path(), FilterLevel::Minimal, None, None, false, 0)?;
+        run(file.path(), FilterLevel::Minimal, None, None, None, None, false, 0)?;
         Ok(())
     }
 
@@ -208,23 +230,37 @@ fn main() {{
     #[test]
     fn test_apply_line_window_tail_lines() {
         let input = "a\nb\nc\nd\n";
-        let output = apply_line_window(input, None, Some(2), &Language::Unknown);
+        let output = apply_line_window(input, None, Some(2), None, None, &Language::Unknown);
         assert_eq!(output, "c\nd\n");
     }
 
     #[test]
     fn test_apply_line_window_tail_lines_no_trailing_newline() {
         let input = "a\nb\nc\nd";
-        let output = apply_line_window(input, None, Some(2), &Language::Unknown);
+        let output = apply_line_window(input, None, Some(2), None, None, &Language::Unknown);
         assert_eq!(output, "c\nd");
     }
 
     #[test]
     fn test_apply_line_window_max_lines_still_works() {
         let input = "a\nb\nc\nd\n";
-        let output = apply_line_window(input, Some(2), None, &Language::Unknown);
+        let output = apply_line_window(input, Some(2), None, None, None, &Language::Unknown);
         assert!(output.starts_with("a\n"));
         assert!(output.contains("more lines"));
+    }
+
+    #[test]
+    fn test_apply_line_window_range_middle() {
+        let input = "a\nb\nc\nd\n";
+        let output = apply_line_window(input, None, None, Some(2), Some(3), &Language::Unknown);
+        assert_eq!(output, "b\nc");
+    }
+
+    #[test]
+    fn test_apply_line_window_range_to_end_preserves_newline() {
+        let input = "a\nb\nc\n";
+        let output = apply_line_window(input, None, None, Some(2), None, &Language::Unknown);
+        assert_eq!(output, "b\nc\n");
     }
 
     fn rtk_bin() -> std::path::PathBuf {
