@@ -472,7 +472,8 @@ fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
 /// `direnv exec .`, `poetry run`, or `bundle exec`. Stripping it lets the inner
 /// command match a filter; the prefix is then re-prepended to the rewrite. The
 /// built-in [`SHELL_PREFIX_BUILTINS`] (`noglob`, `command`, `builtin`, `exec`,
-/// `nocorrect`) are always applied in addition to user-configured prefixes.
+/// `nocorrect`) and built-in wrapper parsers like `uv run` are always applied in
+/// addition to user-configured prefixes.
 ///
 /// Matching is strict: a configured prefix `"foo bar"` matches a command that
 /// starts with `"foo bar "` (or strictly equals `"foo bar"`), not anything
@@ -654,6 +655,100 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
 /// but don't change which command runs. Strip before routing, re-prepend after.
 const SHELL_PREFIX_BUILTINS: &[&str] = &["noglob", "command", "builtin", "exec", "nocorrect"];
 
+const UV_RUN_OPTIONS_WITH_VALUE: &[&str] = &[
+    "--allow-insecure-host",
+    "--cache-dir",
+    "--color",
+    "--config-file",
+    "--config-setting",
+    "--config-settings",
+    "--default-index",
+    "--directory",
+    "--env-file",
+    "--exclude-newer",
+    "--extra-index-url",
+    "--extra",
+    "--find-links",
+    "--group",
+    "--index",
+    "--index-url",
+    "--index-strategy",
+    "--keyring-provider",
+    "--link-mode",
+    "--no-binary-package",
+    "--no-build-isolation-package",
+    "--no-extra",
+    "--no-group",
+    "--only-binary-package",
+    "--only-group",
+    "--package",
+    "--prerelease",
+    "--project",
+    "--python",
+    "--python-platform",
+    "--refresh-package",
+    "--reinstall-package",
+    "--resolution",
+    "--upgrade-package",
+    "--with",
+    "--with-editable",
+    "--with-requirements",
+    "-C",
+    "-P",
+    "-f",
+    "-i",
+    "-p",
+    "-w",
+];
+
+const UV_RUN_FLAG_OPTIONS: &[&str] = &[
+    "--active",
+    "--all-extras",
+    "--all-groups",
+    "--all-packages",
+    "--allow-empty",
+    "--compile-bytecode",
+    "--dev",
+    "--exact",
+    "--frozen",
+    "--isolated",
+    "--locked",
+    "--managed-python",
+    "--no-binary",
+    "--no-build",
+    "--no-build-isolation",
+    "--no-cache",
+    "--no-config",
+    "--no-dev",
+    "--no-default-groups",
+    "--no-env-file",
+    "--no-editable",
+    "--no-index",
+    "--no-managed-python",
+    "--no-project",
+    "--no-progress",
+    "--no-python-downloads",
+    "--no-sources",
+    "--no-sync",
+    "--offline",
+    "--only-binary",
+    "--only-dev",
+    "--quiet",
+    "--refresh",
+    "--reinstall",
+    "--show-resolution",
+    "--system",
+    "--system-certs",
+    "--upgrade",
+    "--verbose",
+    "-n",
+    "-q",
+    "-U",
+    "-v",
+];
+
+const UV_RUN_MODULE_OPTIONS: &[&str] = &["--module", "-m"];
+
 const MAX_PREFIX_DEPTH: usize = 10;
 
 enum ExcludePattern {
@@ -706,6 +801,53 @@ fn normalize_transparent_prefixes(prefixes: &[String]) -> Vec<String> {
     normalized
 }
 
+fn parse_uv_run_wrapper(cmd: &str) -> Option<(&str, &str)> {
+    let tokens = tokenize(cmd);
+    if tokens.len() < 3
+        || tokens[0].kind != TokenKind::Arg
+        || tokens[0].value != "uv"
+        || tokens[1].kind != TokenKind::Arg
+        || tokens[1].value != "run"
+    {
+        return None;
+    }
+
+    let mut i = 2;
+    while i < tokens.len() {
+        if tokens[i].kind != TokenKind::Arg {
+            return None;
+        }
+
+        let token = tokens[i].value.as_str();
+        if token == "--" {
+            i += 1;
+            break;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+
+        let option_name = token.split_once('=').map(|(name, _)| name).unwrap_or(token);
+        if UV_RUN_MODULE_OPTIONS.contains(&option_name) {
+            return None;
+        } else if UV_RUN_OPTIONS_WITH_VALUE.contains(&option_name) && !token.contains('=') {
+            i += 2;
+        } else if UV_RUN_OPTIONS_WITH_VALUE.contains(&option_name)
+            || UV_RUN_FLAG_OPTIONS.contains(&option_name)
+        {
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+
+    let inner = tokens.get(i)?;
+    Some((
+        cmd[..inner.offset].trim_end(),
+        cmd[inner.offset..].trim_start(),
+    ))
+}
+
 fn rewrite_segment(
     seg: &str,
     excluded: &[ExcludePattern],
@@ -750,6 +892,14 @@ fn rewrite_segment_inner(
         let rewritten =
             rewrite_segment_inner(rest_after_env, excluded, transparent_prefixes, depth + 1)?;
         return Some(format!("{}{}", env_prefix, rewritten));
+    }
+
+    if let Some((prefix, rest)) = parse_uv_run_wrapper(trimmed) {
+        if rest.is_empty() {
+            return None;
+        }
+        return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
+            .map(|rewritten| format!("{} {}", prefix, rewritten));
     }
 
     for &prefix in SHELL_PREFIX_BUILTINS {
@@ -2323,6 +2473,98 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("python -m pytest -x tests/", &[]),
             Some("rtk pytest -x tests/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uv_run_pytest() {
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run pytest tests/", &[]),
+            Some("uv run rtk pytest tests/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_env_uv_run_pytest() {
+        assert_eq!(
+            rewrite_command_no_prefixes("PYTHONPATH=. uv run pytest tests/", &[]),
+            Some("PYTHONPATH=. uv run rtk pytest tests/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uv_run_python_m_pytest() {
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run python -m pytest -q", &[]),
+            Some("uv run rtk pytest -q".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uv_run_pytest_with_options() {
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run --with pytest pytest tests/", &[]),
+            Some("uv run --with pytest rtk pytest tests/".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run --env-file .env pytest", &[]),
+            Some("uv run --env-file .env rtk pytest".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run -w pytest pytest tests/", &[]),
+            Some("uv run -w pytest rtk pytest tests/".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run --refresh-package pytest pytest -q", &[]),
+            Some("uv run --refresh-package pytest rtk pytest -q".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run --reinstall-package pytest pytest -q", &[]),
+            Some("uv run --reinstall-package pytest rtk pytest -q".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run --no-sync pytest", &[]),
+            Some("uv run --no-sync rtk pytest".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run -U -n pytest", &[]),
+            Some("uv run -U -n rtk pytest".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uv_run_separator() {
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run -- python -m pytest -q", &[]),
+            Some("uv run -- rtk pytest -q".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uv_run_unknown_inner_skipped() {
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run python script.py", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uv_run_unknown_option_skipped() {
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run --unknown pytest tests/", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uv_run_module_mode_skipped() {
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run -m pytest -q", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run --module pytest -q", &[]),
+            None
         );
     }
 
