@@ -21,6 +21,11 @@ pub enum Classification {
     Ignored,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum JqRewrite {
+    ValidateOnly { file: String },
+}
+
 /// Average token counts per category for estimation when no output_len available.
 pub fn category_avg_tokens(category: &str, subcmd: &str) -> usize {
     match category {
@@ -114,6 +119,15 @@ pub fn classify_command(cmd: &str) -> Classification {
     let cmd_clean = stripped.trim();
     if cmd_clean.is_empty() {
         return Classification::Ignored;
+    }
+
+    if parse_jq_json_rewrite(cmd_clean).is_some() {
+        return Classification::Supported {
+            rtk_equivalent: "rtk json",
+            category: "Files",
+            estimated_savings_pct: 70.0,
+            status: super::report::RtkStatus::Existing,
+        };
     }
 
     // Normalize absolute binary paths: /usr/bin/grep → grep (#485)
@@ -650,6 +664,49 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
     None
 }
 
+fn parse_jq_json_rewrite(cmd: &str) -> Option<JqRewrite> {
+    let tokens = tokenize(cmd);
+    if tokens.len() != 3 || tokens.iter().any(|t| t.kind != TokenKind::Arg) {
+        return None;
+    }
+
+    if tokens[0].value != "jq" {
+        return None;
+    }
+
+    let filter = unquote_simple(&tokens[1].value);
+    let file = tokens[2].value.as_str();
+    if file.starts_with('-') {
+        return None;
+    }
+
+    match filter {
+        "empty" => Some(JqRewrite::ValidateOnly {
+            file: file.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn is_single_stdout_dev_null_redirect(redirect_suffix: &str) -> bool {
+    let tokens = tokenize(redirect_suffix);
+    tokens.len() == 2
+        && tokens[0].kind == TokenKind::Redirect
+        && matches!(tokens[0].value.as_str(), ">" | "1>" | ">>" | "1>>")
+        && tokens[1].kind == TokenKind::Arg
+        && tokens[1].value == "/dev/null"
+}
+
+fn unquote_simple(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 /// Shell prefix builtins that modify how the shell runs a command
 /// but don't change which command runs. Strip before routing, re-prepend after.
 const SHELL_PREFIX_BUILTINS: &[&str] = &["noglob", "command", "builtin", "exec", "nocorrect"];
@@ -785,6 +842,21 @@ fn rewrite_segment_inner(
 
     if cmd_part.starts_with("head -") || cmd_part.starts_with("tail ") {
         return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
+    }
+
+    if cmd_part.starts_with("jq ") {
+        return match parse_jq_json_rewrite(cmd_part) {
+            Some(JqRewrite::ValidateOnly { file }) => {
+                if redirect_suffix.is_empty() {
+                    Some(format!("rtk json {} >/dev/null", file))
+                } else if is_single_stdout_dev_null_redirect(redirect_suffix) {
+                    Some(format!("rtk json {}{}", file, redirect_suffix))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
     }
 
     // Most cat flags (-v, -A, -e, -t, -s, -b, --show-all, etc.) have different
@@ -1419,6 +1491,75 @@ mod tests {
             rewrite_command_no_prefixes("rg \"fn main\"", &[]),
             Some("rtk grep \"fn main\"".into())
         );
+    }
+
+    #[test]
+    fn test_classify_jq_empty() {
+        assert_eq!(
+            classify_command("jq empty data.json"),
+            Classification::Supported {
+                rtk_equivalent: "rtk json",
+                category: "Files",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_jq_empty_with_env_prefix() {
+        assert_eq!(
+            classify_command("FOO=1 jq empty data.json"),
+            Classification::Supported {
+                rtk_equivalent: "rtk json",
+                category: "Files",
+                estimated_savings_pct: 70.0,
+                status: RtkStatus::Existing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_rewrite_jq_identity_skipped() {
+        assert_eq!(rewrite_command_no_prefixes("jq . data.json", &[]), None);
+        assert_eq!(rewrite_command_no_prefixes("jq '.' data.json", &[]), None);
+    }
+
+    #[test]
+    fn test_rewrite_jq_empty_validates_without_stdout() {
+        assert_eq!(
+            rewrite_command_no_prefixes("jq empty data.json", &[]),
+            Some("rtk json data.json >/dev/null".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_jq_empty_dev_null_redirect() {
+        assert_eq!(
+            rewrite_command_no_prefixes("jq empty data.json >/dev/null", &[]),
+            Some("rtk json data.json >/dev/null".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("jq empty data.json 1>/dev/null", &[]),
+            Some("rtk json data.json 1>/dev/null".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_jq_unsupported_forms_skipped() {
+        for command in [
+            "jq -r .name data.json",
+            "jq '.name' data.json",
+            "jq . data.json other.json",
+            "jq .",
+            "jq empty data.json >validated.json",
+            "jq empty data.json 2>/dev/null",
+            "jq empty data.json >/dev/null >validated.json",
+            "jq empty data.json >/dev/null >&2",
+            "jq empty data.json &>/dev/null",
+        ] {
+            assert_eq!(rewrite_command_no_prefixes(command, &[]), None, "{command}");
+        }
     }
 
     #[test]
