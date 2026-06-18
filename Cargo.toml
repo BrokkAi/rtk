@@ -1,5 +1,5 @@
 [package]
-name = "rtk"
+name = "brokk-rtk"
 version = "0.43.0"
 edition = "2021"
 rust-version = "1.91"
@@ -11,6 +11,16 @@ repository = "https://github.com/rtk-ai/rtk"
 readme = "README.md"
 keywords = ["cli", "llm", "token", "filter", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
+
+# Keep the crate, library, and binary/command name as `rtk` even though the
+# crates.io package is published as `brokk-rtk`.
+[lib]
+name = "rtk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rtk"
+path = "src/main.rs"
 
 [features]
 default = []
