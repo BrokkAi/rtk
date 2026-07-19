@@ -16,7 +16,8 @@ use cmds::js::{
     vitest_cmd,
 };
 use cmds::jvm::{gradlew_cmd, mvn_cmd};
-use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd};
+use cmds::php::{ecs_cmd, paratest_cmd, pest_cmd, php_cmd, phpstan_cmd, phpunit_cmd, pint_cmd};
+use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd, uv_cmd};
 use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::system::{
@@ -56,10 +57,14 @@ pub enum AgentTarget {
     Kilocode,
     /// Google Antigravity
     Antigravity,
+    /// Kimi AI
+    Kimi,
     /// Pi coding agent
     Pi,
     /// Hermes CLI
     Hermes,
+    /// Factory Droid CLI
+    Droid,
 }
 
 #[derive(Parser)]
@@ -378,6 +383,14 @@ enum Commands {
         #[arg(long = "no-patch", group = "patch")]
         no_patch: bool,
 
+        /// Trust and enable detected custom filters without prompting
+        #[arg(long = "trust-filters", group = "trust")]
+        trust_filters: bool,
+
+        /// Leave detected custom filters disabled without prompting
+        #[arg(long = "no-trust-filters", group = "trust")]
+        no_trust_filters: bool,
+
         /// Remove RTK artifacts for the selected assistant mode
         #[arg(long)]
         uninstall: bool,
@@ -643,7 +656,7 @@ enum Commands {
 
     /// Read stdin, apply filter, print filtered output (Unix pipe mode)
     Pipe {
-        /// Filter name (cargo-test, pytest, grep, find, git-log, etc.)
+        /// Filter name (cargo-test, pytest, phpunit, phpstan, pint, grep, find, git-log, etc.)
         #[arg(short, long)]
         filter: Option<String>,
 
@@ -654,9 +667,12 @@ enum Commands {
 
     /// Trust project-local TOML filters in current directory
     Trust {
-        /// List all trusted projects
+        /// List all trusted filter files
         #[arg(long)]
         list: bool,
+        /// Trust without prompting (for non-interactive use)
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Revoke trust for project-local TOML filters
@@ -693,6 +709,55 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// PHP command runner with compact output for artisan and syntax checks
+    Php {
+        /// PHP arguments (e.g., artisan about, -l app/Http/Controller.php)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// PHPUnit test runner with compact output
+    Phpunit {
+        /// PHPUnit arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// PHPStan analyzer with compact output
+    Phpstan {
+        /// PHPStan arguments (e.g., analyse src/)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Pest test runner with compact output
+    Pest {
+        /// Pest arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// ParaTest parallel test runner with compact output
+    Paratest {
+        /// ParaTest arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// EasyCodingStandard (ECS) code style fixer with compact output
+    Ecs {
+        /// ECS arguments (e.g., check src/, --fix)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Laravel Pint (PHP-CS-Fixer) code style fixer with compact output
+    Pint {
+        /// Pint arguments (e.g., --test, app/)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Rake/Rails test with compact Minitest output (Ruby)
     Rake {
         /// Rake arguments (e.g., test, test TEST=path/to/test.rb)
@@ -717,6 +782,13 @@ enum Commands {
     /// Pip package manager with compact output (auto-detects uv)
     Pip {
         /// Pip arguments (e.g., list, outdated, install)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// uv run with compact output while preserving uv-managed environment semantics
+    Uv {
+        /// uv arguments (e.g., run pytest, run --project backend python script.py)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -796,6 +868,8 @@ enum HookCommands {
     Gemini,
     /// Process Copilot preToolUse hook (VS Code + Copilot CLI, reads JSON from stdin)
     Copilot,
+    /// Process Factory Droid PreToolUse hook (reads JSON from stdin)
+    Droid,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -860,6 +934,12 @@ enum GitCommands {
     /// Compact branch listing (current/local/remote)
     Branch {
         /// Git branch arguments (supports -d, -D, -m, etc.)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Checkout branch or restore paths -> "ok"
+    Checkout {
+        /// Git checkout arguments (supports -b, branch names, refs, -- paths)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -1512,6 +1592,8 @@ where
 {
     if agent == Some(AgentTarget::Hermes) {
         uninstall_hermes(ctx)
+    } else if agent == Some(AgentTarget::Droid) {
+        hooks::init::uninstall_droid(global, ctx)
     } else {
         let cursor = agent == Some(AgentTarget::Cursor);
         let pi = agent == Some(AgentTarget::Pi);
@@ -1698,6 +1780,13 @@ fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
                 )?,
                 GitCommands::Branch { args } => git::run(
                     git::GitCommand::Branch,
+                    &args,
+                    None,
+                    cli.verbose,
+                    &global_args,
+                )?,
+                GitCommands::Checkout { args } => git::run(
+                    git::GitCommand::Checkout,
                     &args,
                     None,
                     cli.verbose,
@@ -1945,6 +2034,8 @@ fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
             hook_only,
             auto_patch,
             no_patch,
+            trust_filters,
+            no_trust_filters,
             uninstall,
             codex,
             copilot,
@@ -2001,8 +2092,15 @@ fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
                     );
                 }
                 hooks::init::run_antigravity_mode(ctx)?;
+            } else if agent == Some(AgentTarget::Kimi) {
+                if global {
+                    anyhow::bail!("Kimi AI is project-scoped. Use: rtk init --agent kimi");
+                }
+                hooks::init::run_kimi_mode(ctx)?;
             } else if agent == Some(AgentTarget::Hermes) {
                 hooks::init::run_hermes_mode(ctx)?;
+            } else if agent == Some(AgentTarget::Droid) {
+                hooks::init::run_droid_mode(global, ctx)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -2030,6 +2128,14 @@ fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
                     patch_mode,
                     ctx,
                 )?;
+                let filter_trust = if trust_filters {
+                    hooks::init::FilterTrust::Trust
+                } else if no_trust_filters || auto_patch {
+                    hooks::init::FilterTrust::Skip
+                } else {
+                    hooks::init::FilterTrust::Ask
+                };
+                hooks::init::finalize_filter_trust(global, dry_run, filter_trust)?;
             }
             0
         }
@@ -2285,6 +2391,20 @@ fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
 
         Commands::Mypy { args } => mypy_cmd::run(&args, cli.verbose)?,
 
+        Commands::Php { args } => php_cmd::run(&args, cli.verbose)?,
+
+        Commands::Phpunit { args } => phpunit_cmd::run(&args, cli.verbose)?,
+
+        Commands::Phpstan { args } => phpstan_cmd::run(&args, cli.verbose)?,
+
+        Commands::Pest { args } => pest_cmd::run(&args, cli.verbose)?,
+
+        Commands::Paratest { args } => paratest_cmd::run(&args, cli.verbose)?,
+
+        Commands::Ecs { args } => ecs_cmd::run(&args, cli.verbose)?,
+
+        Commands::Pint { args } => pint_cmd::run(&args, cli.verbose)?,
+
         Commands::Rake { args } => rake_cmd::run(&args, cli.verbose)?,
 
         Commands::Rubocop { args } => rubocop_cmd::run(&args, cli.verbose)?,
@@ -2292,6 +2412,8 @@ fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
         Commands::Rspec { args } => rspec_cmd::run(&args, cli.verbose)?,
 
         Commands::Pip { args } => pip_cmd::run(&args, cli.verbose)?,
+
+        Commands::Uv { args } => uv_cmd::run(&args, cli.verbose)?,
 
         Commands::Go { command } => match command {
             GoCommands::Test { args } => go_cmd::run_test(&args, cli.verbose)?,
@@ -2336,6 +2458,10 @@ fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
             }
             HookCommands::Copilot => {
                 hooks::hook_cmd::run_copilot()?;
+                0
+            }
+            HookCommands::Droid => {
+                hooks::hook_cmd::run_droid()?;
                 0
             }
             HookCommands::Check { agent: _, command } => {
@@ -2572,8 +2698,8 @@ fn run_cli_from(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
             core::utils::exit_code_from_status(&status, &cmd_name)
         }
 
-        Commands::Trust { list } => {
-            hooks::trust::run_trust(list)?;
+        Commands::Trust { list, yes } => {
+            hooks::trust::run_trust(list, yes)?;
             0
         }
 
@@ -2655,10 +2781,18 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Curl { .. }
             | Commands::Ruff { .. }
             | Commands::Pytest { .. }
+            | Commands::Php { .. }
+            | Commands::Phpunit { .. }
+            | Commands::Phpstan { .. }
+            | Commands::Pest { .. }
+            | Commands::Paratest { .. }
+            | Commands::Ecs { .. }
+            | Commands::Pint { .. }
             | Commands::Rake { .. }
             | Commands::Rubocop { .. }
             | Commands::Rspec { .. }
             | Commands::Pip { .. }
+            | Commands::Uv { .. }
             | Commands::Go { .. }
             | Commands::GolangciLint { .. }
             | Commands::Gt { .. }
@@ -3030,10 +3164,18 @@ mod tests {
             "ruff",
             "pytest",
             "mypy",
+            "php",
+            "phpunit",
+            "phpstan",
+            "pest",
+            "paratest",
+            "ecs",
+            "pint",
             "rake",
             "rubocop",
             "rspec",
             "pip",
+            "uv",
             "go",
             "gt",
             "golangci-lint",
